@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+
+import argparse, socket, time, json, select, struct, sys, math, os
+from datetime import datetime
+
+BROADCAST = "FFFF"
+
+class Replica:
+    def __init__(self, port, id, others):
+        self.port = port
+        self.id = id
+        self.others = others
+
+        self.leader = "FFFF" #default leader
+        self.occupation = "follower" # potential occupations are leader, follower, or candidate(election candidate)
+        self.vote_count = 0
+
+        self.last_timer_sent = datetime.now()
+        self.last_timer_recv = datetime.now()
+
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('localhost', 0))
+
+        print("Replica %s starting up" % self.id, flush=True)
+        hello = { "src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello" }
+        self.send(hello)
+        print("Sent hello message: %s" % hello, flush=True)
+
+    # same send method as starter code
+    def send(self, message):
+        print(f"Sending: {message}", flush=True)
+        self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
+
+    # main run method
+    def run(self):
+        while True:
+            if self.occupation == "leader":
+                # project says leader failure timeout is done in X milliseconds (Currently set to 30)
+                if self.has_timed_out(self.last_timer_sent, 30):
+                    print("leader has timed out") # implement basic version of append entries RPC call
+            else:
+                # hold elections every 300 milliseconds
+                if self.has_timed_out(self.last_timer_recv, 300):
+                    print("calling an election!")
+                    self.election()
+
+            data, addr = self.socket.recvfrom(65535)
+            msg = data.decode('utf-8')
+            print("Received message '%s'" % (msg,), flush=True)
+            self.handle_message(msg)
+
+    # calls the appropriate function based on the messsage "type"
+    def handle_message(self, msg):
+        msg = json.loads(msg)
+        print(f"Received message {msg}")
+        if msg["type"] == "put":
+            print("calling put method")
+            self.handle_put(msg)
+        elif msg["type"] == "get":
+            print("calling get method")
+            self.handle_get(msg)
+        elif msg["type"] == "RequestVote":
+            print("calling request vote method")
+            self.handle_request_vote(msg)
+        elif msg["type"] == "RequestVoteResponse":
+            print("calling request vote response method")
+            self.handle_request_vote_response(msg)
+        elif msg["type"] == "AppendEntry":
+            print("calling append entry method")
+            self.handle_append_entry(msg)
+        elif msg["type"] == "AppendEntryResponse":
+            print("calling append entry response method")
+            self.handle_append_entry_response(msg)
+
+    # handles put type messages
+    def handle_put(self, msg):
+        if self.occupation == "leader":
+            fail_response = {
+                "src": self.id,
+                "dst": msg["src"],
+                "leader": "FFFF",
+                "type": "fail",  
+                "MID": msg["MID"]
+            }
+            self.send(fail_response)
+        else:
+            if self.leader != "FFFF":
+                redirect_response = {
+                    "src": self.id,
+                    "dst": msg["src"],
+                    "leader": self.leader,
+                    "type": "redirect",
+                    "MID": msg["MID"]
+                }
+                self.send(redirect_response)
+
+    # handles get type messages
+    def handle_get(self, msg):
+        if self.occupation == "leader":
+            fail_response = {
+                "src": self.id,
+                "dst": msg["src"],
+                "leader": "FFFF",
+                "type": "fail",  
+                "MID": msg["MID"]
+            }
+            self.send(fail_response)
+        else:
+            if self.leader != "FFFF":
+                redirect_response = {
+                    "src": self.id,
+                    "dst": msg["src"],
+                    "leader": self.leader,
+                    "type": "redirect",
+                    "MID": msg["MID"]
+                }
+                self.send(redirect_response)
+
+    def handle_request_vote(self, msg):
+        pass
+
+    def handle_request_vote_response(self, msg):
+        pass
+
+    def handle_append_entry(self, msg):
+        pass
+
+    def handle_append_entry_response(self, msg):
+        pass
+
+    # returns true if time has exceeded the timeout limit
+    def has_timed_out(self, start_time, timeout):
+        time_passed = datetime.now() - start_time
+        time_passed_milliseconds = int((time_passed.seconds * 1000) + (time_passed.microseconds / 1000))
+        return time_passed_milliseconds > timeout
+    
+    # simulate an election in which we vote for ourselves
+    def election(self):
+        self.vote_count = 1
+        self.occupation = "candidate" # we are now a candidate in the election
+        self.last_timer_recv = datetime.now()  # reset election timer
+        self.leader = "FFFF"
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='run a key-value store')
+    parser.add_argument('port', type=int, help="Port number to communicate")
+    parser.add_argument('id', type=str, help="ID of this replica")
+    parser.add_argument('others', metavar='others', type=str, nargs='+', help="IDs of other replicas")
+    args = parser.parse_args()
+    replica = Replica(args.port, args.id, args.others)
+    replica.run()
