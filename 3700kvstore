@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
 
-import argparse, socket, time, json, select, struct, sys, math, os
-from datetime import datetime
+import argparse, socket, time, json, select, random
 
 BROADCAST = "FFFF"
+kvstore = {}
 
+# represents a replica in a RAFT consensus protocol
 class Replica:
     def __init__(self, port, id, others):
         self.port = port
         self.id = id
         self.others = others
+        self.currentLeader = "FFFF"
+        self.state = "FOLLOWER" #potential occupations are leader, follower, and candidate
 
-        self.leader = "FFFF" #default leader
-        self.occupation = "follower" # potential occupations are leader, follower, or candidate(election candidate)
-        self.vote_count = 0
+        self.vote_count = 0 #votes this replica received
+        self.term = 0 #election terms
+        self.voted_for = None #candidate that this replica voted for
 
-        self.last_timer_sent = datetime.now()
-        self.last_timer_recv = datetime.now()
+        self.transaction_log = [] #log of each entry in the Raft algorithm
+        self.committed = 0 #tracks index of highest log entry to be committed
+        self.next_index = {} #starts at the index of the new leaders log, helps choose the next entry to commit
+        self.match_index = {} #tracks highest log index in followers. Used by leader to safely commit entries
+        self.msg_queue = [] #queue used by followers to queue incoming get and put requests when there is no leader
+
+        self.last_heartbeat_recv = time.time() # last hearbeat received from leader
+        self.heartbeat_timeout = random.uniform(.3, .5) # leader heartbeat timeout -> re elect leader
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(('localhost', 0))
@@ -28,118 +37,383 @@ class Replica:
 
     # same send method as starter code
     def send(self, message):
-        print(f"Sending: {message}", flush=True)
         self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
 
-    # main run method
     def run(self):
         while True:
-            if self.occupation == "leader":
-                # project says leader failure timeout is done in X milliseconds (Currently set to 30)
-                if self.has_timed_out(self.last_timer_sent, 30):
-                    print("leader has timed out") # implement basic version of append entries RPC call
-            else:
-                # hold elections every 300 milliseconds
-                if self.has_timed_out(self.last_timer_recv, 300):
-                    print("calling an election!")
+            socket = [self.socket]
+            if self.state == "FOLLOWER" or self.state == "CANDIDATE":
+                #if heartbeat times out, hold new election
+                if time.time() - self.last_heartbeat_recv > self.heartbeat_timeout:
+                    self.resettimer()
                     self.election()
-
-            data, addr = self.socket.recvfrom(65535)
-            msg = data.decode('utf-8')
-            print("Received message '%s'" % (msg,), flush=True)
-            self.handle_message(msg)
+                # handle messages, if any
+                socks = select.select(socket, [], [], self.heartbeat_timeout)[0]
+                for sock in socks:
+                    data, addr = sock.recvfrom(65535)
+                    msg = data.decode('utf-8')
+                    self.handle_message(msg)
+            else: #self is leader
+                current_time = time.time()
+                socks = select.select(socket, [], [], 0.1)[0]
+                time_passed = time.time()
+                # send heartbeat if enough time has passed
+                if time_passed - current_time > 0.1:
+                    for replica in self.others:
+                        heartbeat = {
+                            "src": self.id, 
+                            "dst": replica , 
+                            "leader": self.id, 
+                            "type": "update", 
+                            "commitlength": self.committed, 
+                            "term": self.term
+                        }
+                        self.send(heartbeat)
+                        self.lastHeartbeatSent = current_time #
+                for sock in socks:
+                    data, addr = sock.recvfrom(65535)
+                    msg = data.decode('utf-8')
+                    self.handle_message(msg)
 
     # calls the appropriate function based on the messsage "type"
     def handle_message(self, msg):
         msg = json.loads(msg)
-        print(f"Received message {msg}")
         if msg["type"] == "put":
-            print("calling put method")
             self.handle_put(msg)
         elif msg["type"] == "get":
-            print("calling get method")
             self.handle_get(msg)
-        elif msg["type"] == "RequestVote":
-            print("calling request vote method")
-            self.handle_request_vote(msg)
-        elif msg["type"] == "RequestVoteResponse":
-            print("calling request vote response method")
-            self.handle_request_vote_response(msg)
-        elif msg["type"] == "AppendEntry":
-            print("calling append entry method")
+        elif msg['type'] == "update":
+            self.handle_update(msg)
+        elif msg['type'] == "VoteRequest":
+            self.handle_vote_request(msg)
+        elif msg['type'] == "VoteResponse":
+            self.handle_vote_response(msg)
+        elif msg['type'] == "AppendEntry":
             self.handle_append_entry(msg)
-        elif msg["type"] == "AppendEntryResponse":
-            print("calling append entry response method")
+        elif msg['type'] == "AppendEntryResponse":
             self.handle_append_entry_response(msg)
 
-    # handles put type messages
-    def handle_put(self, msg):
-        if self.occupation == "leader":
-            fail_response = {
-                "src": self.id,
-                "dst": msg["src"],
-                "leader": "FFFF",
-                "type": "fail",  
-                "MID": msg["MID"]
-            }
-            self.send(fail_response)
-        else:
-            if self.leader != "FFFF":
-                redirect_response = {
-                    "src": self.id,
-                    "dst": msg["src"],
-                    "leader": self.leader,
-                    "type": "redirect",
-                    "MID": msg["MID"]
-                }
-                self.send(redirect_response)
+    #reset our election timer
+    def resettimer(self):
+        self.last_heartbeat_recv = time.time()
+        self.heartbeat_timeout = random.uniform(.3,.5)
 
-    # handles get type messages
+    # handles get requests from the client            
     def handle_get(self, msg):
-        if self.occupation == "leader":
-            fail_response = {
-                "src": self.id,
-                "dst": msg["src"],
-                "leader": "FFFF",
-                "type": "fail",  
-                "MID": msg["MID"]
-            }
-            self.send(fail_response)
-        else:
-            if self.leader != "FFFF":
-                redirect_response = {
+        # if self is leader, try fetching the value from the key value store
+        if self.state == "LEADER":
+            response = {
                     "src": self.id,
-                    "dst": msg["src"],
-                    "leader": self.leader,
-                    "type": "redirect",
-                    "MID": msg["MID"]
+                    "dst": msg['src'],
+                    "leader": self.currentLeader,
+                    "type": "ok",
+                    "MID": msg['MID'],
+                    "value": []
                 }
-                self.send(redirect_response)
+            try: # send response with valid value
+                value = kvstore[msg['key']] # value from key value store using msg key
+                response["value"] = value
+                self.send(response) 
+            except KeyError: # send response with no value from kvstore
+                self.send(response)
+        #redirect or queue if self is not leader
+        else:
+            if msg["leader"] != self.currentLeader:
+                if self.currentLeader == 'FFFF':
+                    self.msg_queue.append(msg)
+                else:
+                    redirect_message = {
+                        "src": self.id,
+                        "dst": msg['src'],
+                        "leader": self.currentLeader,
+                        "type": "redirect",
+                        "MID": msg['MID']
+                    }
+                    self.send(redirect_message)
 
-    def handle_request_vote(self, msg):
-        pass
+    #handles put requests from the client
+    def handle_put(self, msg):
+        if self.state == "LEADER":
+            # leader appends entry to log
+            entry = ((msg['key'], msg['value'], msg['src'], msg['MID']), self.term)
+            self.transaction_log.append(entry)
+            self.match_index[self.id] = len(self.transaction_log)
+            #replicate entry for each follower
+            for replica in self.others:
+                entries_to_send = self.create_entries(replica)
+                append_msg = {
+                    "src": self.id, 
+                    "dst": replica,  
+                    "leader": self.currentLeader, 
+                    "type": "AppendEntry", 
+                    "commitlength": self.committed, 
+                    "entries": entries_to_send, 
+                    "term": self.term ,
+                    "kvstorelen" : len(kvstore)
+                }
+                # respond appropriately depending on if this is the first message to this replica
+                if self.next_index[replica] == 0:
+                    append_msg['lastIndex'] = 0
+                    self.send(append_msg)
+                else:
+                    next_index = self.next_index[replica]
+                    term = self.transaction_log[next_index - 1][1]
+                    append_msg['lastIndex'] = next_index
+                    append_msg['lastTerm'] = term
+                    self.send(append_msg)
+        else:
+            self.msg_queue.append(msg)
 
-    def handle_request_vote_response(self, msg):
-        pass
+    #creates the entries for a given follower based on the leaders transaction log and the followers nextIndex
+    def create_entries(self, replica):
+        log_length = self.next_index[replica]
+        # if the distance between the replica and the follower is over 80 stop sending messages
+        if len(self.transaction_log) - log_length > 80:
+            return []
+        else:
+            entries = self.transaction_log[log_length::]
+            return entries 
 
-    def handle_append_entry(self, msg):
-        pass
+    # handle update messages from leader
+    def handle_update(self, msg):
+        self.resettimer() #updates come from leader, so reset timer
+        #if self term is greater(more recent) than the leader's, make leader step down
+        if msg['term'] < self.term:
+            response = {
+                "src": self.id,
+                "dst": msg['src'],
+                "leader": self.currentLeader,
+                "type" : "AppendEntryResponse",
+                "success" : "false",
+                "term": self.term
+            }
+            self.send(response)
+        else: # otherwise, simply forward redirects for queued messages
+            self.currentLeader = msg["leader"]
+            self.send_redirects()  
 
-    def handle_append_entry_response(self, msg):
-        pass
+    #send redirect for queued messages to the current leader.     
+    def send_redirects(self):
+        if self.state == "LEADER":
+            if len(self.msg_queue) > 0:
+                for msg in self.msg_queue:
+                    redirectmessage = {
+                        "src": self.id,
+                        "dst": msg['src'],
+                        "leader": self.id,
+                        "type": "redirect",
+                        "MID": msg['MID']
+                    }
+                    self.send(redirectmessage)
+                    self.msg_queue.remove(msg)
+        else:
+            if self.currentLeader != 'FFFF' and len(self.msg_queue) > 0:
+                for msg in self.msg_queue:
+                    redirectmessage = {
+                        "src": self.id,
+                        "dst": msg['src'],
+                        "leader": self.currentLeader, # this is changed
+                        "type": "redirect",
+                        "MID": msg['MID']
+                    }
+                    self.send(redirectmessage)
+                    self.msg_queue.remove(msg) 
 
-    # returns true if time has exceeded the timeout limit
-    def has_timed_out(self, start_time, timeout):
-        time_passed = datetime.now() - start_time
-        time_passed_milliseconds = int((time_passed.seconds * 1000) + (time_passed.microseconds / 1000))
-        return time_passed_milliseconds > timeout
-    
-    # simulate an election in which we vote for ourselves
+    # simulate an election where we vote for ourselves
     def election(self):
-        self.vote_count = 1
-        self.occupation = "candidate" # we are now a candidate in the election
-        self.last_timer_recv = datetime.now()  # reset election timer
-        self.leader = "FFFF"
+        self.term += 1
+        self.state = "CANDIDATE"
+        self.vote_count = 0 # reset vote count at start of new election
+
+        #for each replica relay the message and the new term number, and tell themt that we want to request a vote for a leader.
+        request_vote_msg = {
+            "src": self.id,
+            "dst": None,
+            "leader": self.currentLeader,
+            "type": "VoteRequest",
+            "newterm": self.term,
+            "votedfor" : self.id,
+            "lastIndex": len(self.transaction_log)}
+        
+        # if applicable, set lastTerm value
+        if len(self.transaction_log) > 0:
+            request_vote_msg["lastTerm"] = self.transaction_log[-1][1]
+
+        # send vote request message to every other node in self.others
+        for replica in self.others:
+            request_vote_msg["dst"] = replica
+            self.send(request_vote_msg) 
+            self.voted_for = self.id
+            self.vote_count = 1
+            #if we vote for ourselves, then we have a vote
+
+    # processes a vote request      
+    def handle_vote_request(self, msg):
+        received_term = msg['newterm']
+        response = {
+            "src": self.id,
+            "dst": msg["src"],
+            "leader": self.currentLeader,
+            "type": "VoteResponse",
+            "voted?": "false",  # Default to not voting
+            "term": self.term
+        }
+       # if received term is greater(more recent) than self's term, revert to a follower
+        if received_term > self.term:
+            self.state = "FOLLOWER"
+            self.term = received_term
+            self.voted_for = None
+            self.resettimer()
+            response["term"] = self.term
+            # check if candidate's log length is compatible with ours
+            candidate_log_length = msg["lastIndex"]
+            # if candidate's log is empty
+            if candidate_log_length == 0:
+                if len(self.transaction_log) == candidate_log_length and self.voted_for == None:
+                    self.voted_for = msg['src']
+                    response["voted?"] = "true"
+            else:
+                #if candidate's log is not empty, check if it is as long as self's log
+                if len(self.transaction_log) <= candidate_log_length:
+                    #and if candidate's last log entry is as recent as self's
+                    ourlastTerm = self.transaction_log[-1][1]
+                    if msg['lastTerm'] >= ourlastTerm and self.voted_for == None:
+                        self.voted_for = msg['src']
+                        response["voted?"] = "true"
+        self.send(response) # send appropriate response at the end
+
+    #processes a vote response during an election
+    def handle_vote_response(self, msg):
+        self.resettimer()
+        # if received term is greater(more recent) than self's term, revert to a follower
+        if msg["term"] > self.term:
+            self.state = "FOLLOWER"
+            self.term = msg["term"]
+            self.voted_for = None
+            self.vote_count = 0
+        # otherwise, increment vote count if vote was true and term is the same
+        elif msg['voted?'] == "true" and msg["term"] == self.term:
+            self.vote_count += 1
+
+        # handle ths case for if we are the new leader
+        if self.vote_count >= 3:
+            #clear total amount of votes recieved and shift into leader state
+            self.vote_count = 0
+            self.state = "LEADER"
+            # announce to each replica the heartbeat and establishment of new leader
+            for replica in self.others:
+                new_leader_announcement = {
+                    "src": self.id,
+                    "dst": replica ,
+                    "leader": self.id,
+                    "type": "update",
+                    "term": self.term,
+                    "commitlength": self.committed
+                }
+                self.currentLeader = self.id
+                self.next_index[replica] = len(self.transaction_log)
+                self.match_index[replica] = 0
+                self.send(new_leader_announcement)
+            #handle potential redirects for when we did not know the leader 
+            self.send_redirects() 
+
+    #process an AppendEntry RPC from the leader, determines whether it can append to its log based on RAFT protocols
+    def handle_append_entry(self, msg):
+        response = {
+            "src": self.id, 
+            "dst": msg['src'],  
+            "leader": self.currentLeader, 
+            "type" : "AppendEntryResponse", 
+            "success" : "false", 
+            "term": self.term
+        }
+        # check if the leader's term is greater (more recent) compared to our term
+        if msg["term"] >= self.term:
+            self.voted_for = None
+            self.state = "FOLLOWER"
+            self.term = msg["term"]
+            self.resettimer()
+            if len(self.transaction_log) >= msg['lastIndex'] and \
+            (msg['lastIndex'] == 0 or self.transaction_log[msg['lastIndex'] - 1][1] == msg['lastTerm']):
+                self.synchronize_log(msg['entries'], msg['lastIndex'])
+                # commits entries from the transaction log up to the specified commit length provided by the leader
+                while self.committed < msg['commitlength']:
+                    current_entry = self.transaction_log[self.committed][0]
+                    key, value = current_entry[0], current_entry[1]
+                    kvstore[key] = value
+                    self.committed += 1
+                response.update({"success": "true", "loglength": len(self.transaction_log)})
+        self.send(response)
+
+    # synchronize the log with the leader (based on leader's entries and expected log index)
+    def synchronize_log(self, incoming_entries, expected_index):
+        # if local log is longer than the expected log from leader
+        if len(self.transaction_log) > expected_index:
+            # calculate the last log index to compare
+            last_log_index =  min(len(self.transaction_log), len(incoming_entries) + expected_index) - 1
+            # check for mismatch against the index of incoming entries
+            if self.transaction_log[last_log_index][1] != incoming_entries[(last_log_index - (expected_index - 1)) - 1][1]:
+                # if mismatch, truncate local log
+                newlog = self.transaction_log[:expected_index]
+                self.transaction_log = newlog
+
+        # append any new entries from the point where the local log matches the leader's log
+        synchronized_entries = len(self.transaction_log) - expected_index
+        entries = incoming_entries[synchronized_entries::]
+        self.transaction_log.extend(entries)
+
+    #processes responses from followers to AppendEntry RPCs
+    def handle_append_entry_response(self, msg):
+        if self.state == "LEADER":
+            # if received term is greater(more recent) than self's term, revert to a follower
+            if msg["term"] > self.term:
+                self.state = "FOLLOWER"
+                self.term = msg["term"]
+                self.voted_for = None
+                self.currentLeader = "FFFF"
+            else:
+                if msg['success'] == "true": # successful append
+                    self.match_index[msg['src']] = msg['loglength']
+                    self.next_index[msg['src']] = msg['loglength']
+                    self.update_committed_entries()
+                else: # failed append
+                    self.next_index[msg["src"]] -= 1
+                    new_entries = self.create_entries(msg["src"])    
+                    new_term = self.transaction_log[self.next_index[msg["src"]]][1]                    
+                    append_msg = {
+                        "src": self.id,
+                        "dst": msg["src"],
+                        "leader": self.currentLeader,
+                        "type": "AppendEntry",
+                        "commitlength": self.committed,
+                        "entries": new_entries,
+                        "lastIndex" : self.next_index[msg["src"]],
+                        "lastTerm" : new_term,
+                        "term": self.term
+                    }
+                    self.send(append_msg)
+
+    # updates committed entries in the log
+    def update_committed_entries(self):
+        while self.committed < len(self.transaction_log):
+            committed_entries = 0
+            # count how many replicas have committed this entry
+            for replica_index in self.match_index.values():
+                if replica_index > self.committed:
+                    committed_entries += 1
+            # we need at least 3 commit messages
+            if committed_entries >= 3:
+                self.committed +=1
+                # extract key, value and update the key value store
+                entry = self.transaction_log[self.committed - 1][0]
+                key, value, src, mid = entry[0], entry[1], entry[2], entry[3]
+                kvstore[key] = value
+                # respond to the client who made the request
+                response = {"src": self.id, "dst": src,  "leader": self.currentLeader, "type": "ok", "MID": mid}
+                self.send(response)
+            # break the loop if no additional entries can be committed
+            else:
+                break
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='run a key-value store')
